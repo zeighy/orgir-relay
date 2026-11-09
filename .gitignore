@@ -1,0 +1,9 @@
+# Local configuration (copy config.example.php to config.php)
+/config.php
+/skill/image-gen/relay.env
+# Runtime data
+/storage/*
+!/storage/.gitkeep
+*.log
+# Editor / tooling
+/.claude/

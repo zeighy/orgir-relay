@@ -1,0 +1,11 @@
+RewriteEngine On
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteRule ^ index.php [L]
+
+# Pass the Authorization header through to PHP (CGI/FastCGI)
+RewriteCond %{HTTP:Authorization} .
+RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+<FilesMatch "^(config\.php|moderation\.php|relay\.log)$">
+    Require all denied
+</FilesMatch>
