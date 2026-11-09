@@ -33,6 +33,19 @@ Optional: a URL prefix (`bin/nginx-conf.sh example.com /relay`), `--http` for pl
 
 `/live_test_page_*` are debugging tools: remove or block them (and `/howto`, if you don't want it public) on a public deployment. The paths are hardcoded in `index.php`.
 
+**Security note:** `/history` and the `/live_test_page_*` pages expose prompts, generated content and a way to spend your OpenRouter credit, and they are only protected by a token. Consider making them reachable only from an internal network (VPN, Tailscale, LAN, or an IP allowlist) instead of the public internet, e.g. in nginx:
+
+```nginx
+location ~ ^/(relay/)?(history|live_test_page_\d+) {
+    allow 100.64.0.0/10;   # example: Tailscale / internal range
+    allow 127.0.0.1;
+    deny all;
+    # ...then the same fastcgi/proxy handling as your other locations
+}
+```
+
+Keep the API routes (`/generate`, `/speech`, ...) public only if clients need them. If you must expose `/history`, enable Turnstile and use a long random viewer token.
+
 Security: bearer tokens stored only as SHA-256 hashes, constant-time comparison, per-token rate limit / model restrictions / expiry, optional IP allowlist, auth-failure delay, images served only through authenticated route, `config.php` and `storage/` blocked from the web.
 
 Test:
