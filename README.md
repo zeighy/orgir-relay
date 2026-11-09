@@ -26,6 +26,12 @@ Optional: a URL prefix (`bin/nginx-conf.sh example.com /relay`), `--http` for pl
 | `GET /images/{file}` | yes | download saved image |
 | `POST /speech` | yes | text to speech (mp3): JSON `{input, model?, voice?, response_mode?, speed?, elevenlabs?}` |
 | `GET /audio/{file}` | yes | download saved speech |
+| `GET /howto` | no | human-readable usage guide (how to generate images and speech) |
+| `GET /history` | viewer token | unadvertised history viewer: prompts, results, cost and screening verdicts. Needs a separate viewer token (`php bin/make-token.php "viewer" --viewer`), set in `security.viewer_tokens`. Sign-in can be protected with Cloudflare Turnstile (`turnstile` in `config.php`) |
+| `GET /live_test_page_99` | token entered in page | manual test page for image generation (`test.php`) |
+| `GET /live_test_page_89` | token entered in page | manual test page for speech (`test_speech.php`) |
+
+`/live_test_page_*` are debugging tools: remove or block them (and `/howto`, if you don't want it public) on a public deployment. The paths are hardcoded in `index.php`.
 
 Security: bearer tokens stored only as SHA-256 hashes, constant-time comparison, per-token rate limit / model restrictions / expiry, optional IP allowlist, auth-failure delay, images served only through authenticated route, `config.php` and `storage/` blocked from the web.
 
