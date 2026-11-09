@@ -64,6 +64,36 @@ Uploaded and inline images are checked against the actual bytes (PNG, JPEG, WebP
 curl -X POST http://127.0.0.1:8080/generate -H "Authorization: Bearer imgr_..." -F prompt="make the sky purple" -F image=@photo.jpg
 ```
 
+## Moderation
+
+Everything is under `moderation` in `config.php` and is **off by default** (`moderation.enabled`). Checks run before anything is sent to the image model, in this order, and stop at the first rejection:
+
+1. **Keyword / regex filter** (free, offline). Whole-word `keywords`, `strict_keywords` (substring match with all spacing removed), your own `regex` patterns and an `allow` list of harmless phrases (e.g. "breast cancer", "Essex"). A `normalize` step undoes common bypasses: look-alike and full-width characters, leetspeak (`p0rn`), separators (`p.o.r.n`), repeated letters (`pooorn`) and plural/verb suffixes. Each can be turned off. Test rules offline with `php bin/check-prompt.php "some prompt"`.
+2. **Second opinion on the prompt** (`moderation.second_opinion`, optional). Asks TypeSafe's Jev decision model on OpenRouter whether the prompt requests sexual content. Only runs if the keyword check passed. Rejects at or above `threshold`; `on_error` chooses fail open (`allow`) or fail closed (`reject`). Costs a fraction of a cent per prompt, billed to your OpenRouter key. Test with `php bin/check-prompt.php --second-opinion "..."`.
+3. **Reference image inspection** (`moderation.image_check`, optional). Every uploaded or inline reference image is checked with Cloudflare's Clef model (`cloudflare/clef-flash` or the larger `cloudflare/clef`) through OpenRouter's Decisions API. The first image scoring at or above `threshold` rejects the request with error code `image_rejected`. Several images are checked in one batched request (images are shrunk to fit, which needs GD or Imagick); if the set is flagged, each image is re-checked alone to find the offender. `https` image links can't be inspected, so `url_images` decides whether they are rejected (default) or allowed unchecked. The `question` is editable; by default swimwear, underwear, non-sexual toplessness and artistic nudity pass, and anything sexualising a minor never does. Test with `php bin/check-image.php photo.jpg`.
+
+What callers see: only the generic `moderation.message` / `image_check.message` (or `async_message` for async jobs, where the job status becomes `rejected`). The matched rule, score and who sent it appear only in `relay.log` and `/history`. Speech requests skip the keyword filter unless both `moderation.enabled` and `speech.moderation` are true.
+
+### Quarantined reference images
+
+When `image_check` rejects an image, a copy is kept as evidence (`image_check.quarantine`, on by default):
+
+- It is encrypted (OpenSSL/libsodium) with `quarantine.key`, or with an auto-generated `storage/quarantine/.key`. **Back that key up**: without it quarantined images can't be decrypted. If no cipher is available the raw bytes are stored with mode 000 (`allow_plaintext`), or dropped if you set that to `false`.
+- It is never served over HTTP and never displayed in `/history`. `/history` shows only a "withheld" box with the image's **File id** (like `q0123456789abcdef0123`) and the token label, IP and time.
+- Items are deleted after `retention_days` (default 90, `0` = keep forever).
+
+To view one, you need shell access to the server. Use the File id from `/history`:
+
+```
+php bin/quarantine.php list                  # recent items: id, time, token label, ip, size
+php bin/quarantine.php show <id>             # who/when/prompt/hash; does not touch the image
+php bin/quarantine.php export <id> out.jpg   # decrypt to a file (mode 0600, refuses to overwrite)
+php bin/quarantine.php delete <id>           # permanently delete image and record
+php bin/quarantine.php purge                 # delete items older than retention_days
+```
+
+If the fallback files are unreadable by your user, re-run `export` with `sudo`. `export` verifies the SHA-256 against the record and warns on a mismatch. Delete exported files when you're done. Quarantined images may be illegal to keep or view in some jurisdictions (for example, if they depict minors), so check your local obligations before exporting, and prefer `delete` where retention isn't required.
+
 ## Claude skill
 `skill/image-gen/` holds the skill: `SKILL.md` plus `relay.sh`, which calls the relay and saves the images without exposing the token.
 - **Claude Code:** copy the folder to `~/.claude/skills/image-gen/` and set `IMAGE_RELAY_URL` / `IMAGE_RELAY_TOKEN` in the `env` section of `~/.claude/settings.json`.
