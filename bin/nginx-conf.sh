@@ -8,7 +8,8 @@
 #
 # Env overrides: PHP_FPM (socket, e.g. unix:/run/php/php8.5-fpm.sock or 127.0.0.1:9000),
 #                SSL_CERT, SSL_KEY (default: Let's Encrypt paths for server_name),
-#                MAX_BODY (default 40m; keep in line with PHP post_max_size).
+#                MAX_BODY (default 40m; keep in line with PHP post_max_size),
+#                READ_TIMEOUT (default 3600s; longest synchronous request nginx waits for).
 #
 # Example: bin/nginx-conf.sh relay.example.com | sudo tee /etc/nginx/sites-available/relay
 set -euo pipefail
@@ -48,6 +49,7 @@ fi
 SSL_CERT=${SSL_CERT:-/etc/letsencrypt/live/$server_name/fullchain.pem}
 SSL_KEY=${SSL_KEY:-/etc/letsencrypt/live/$server_name/privkey.pem}
 MAX_BODY=${MAX_BODY:-40m}
+READ_TIMEOUT=${READ_TIMEOUT:-3600s}
 
 if [ "$mount" = "/" ]; then
     location="location /"
@@ -81,8 +83,12 @@ $listen
         fastcgi_param SCRIPT_NAME     $script_name;
         fastcgi_pass $PHP_FPM;
 
-        # Up to n=4 sequential OpenRouter calls at 120 s each.
-        fastcgi_read_timeout 500s;
+        # A synchronous /generate can legitimately run for a long time: up to n=4 images one after another, each
+        # up to openrouter.timeout (300 s) per try plus retries, and local endpoints wait longer still (960 s plus
+        # busy_wait_seconds). If nginx gives up first the client gets a 504 while PHP keeps going (and is billed).
+        # Clients should use "async": true; this only has to cover synchronous callers. Keep PHP-FPM's
+        # request_terminate_timeout at least as high.
+        fastcgi_read_timeout $READ_TIMEOUT;
         fastcgi_send_timeout 120s;
     }
 }

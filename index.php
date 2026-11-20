@@ -40,6 +40,7 @@ set_exception_handler(function (Throwable $e) use ($config): void {
 function respond(int $status, array $body): never
 {
     pending_clear();
+    slot_release();
     if (isset($GLOBALS['relay_job_ctx'])) { // running as a detached async job: store the result instead
         job_finish($status, $body);
         exit;
@@ -88,16 +89,12 @@ function authenticate(array $config): array
 {
     $sec = $config['security'];
 
-    if (!empty($sec['require_https'])) {
-        $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
-            || strtolower($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https';
-        if (!$https) {
-            fail(400, 'https_required', 'HTTPS is required.');
-        }
+    if (!empty($sec['require_https']) && !is_https($config)) {
+        fail(400, 'https_required', 'HTTPS is required.');
     }
 
-    $ip = $_SERVER['REMOTE_ADDR'] ?? '';
-    if (!empty($sec['ip_allowlist']) && !in_array($ip, $sec['ip_allowlist'], true)) {
+    $ip = client_ip($config);
+    if (!empty($sec['ip_allowlist']) && !ip_in_list($ip, (array)$sec['ip_allowlist'])) {
         log_line($config, "DENY ip=$ip reason=ip_not_allowed");
         fail(403, 'forbidden', 'Access denied.');
     }
@@ -126,6 +123,68 @@ function authenticate(array $config): array
     }
 
     return $matched;
+}
+
+/** True when $ip equals an entry of $list or falls inside one of its CIDR ranges ("10.0.0.0/8", "fd00::/8"). */
+function ip_in_list(string $ip, array $list): bool
+{
+    $bin = @inet_pton($ip);
+    if ($bin === false) {
+        return false;
+    }
+    foreach ($list as $entry) {
+        [$net, $bits] = array_pad(explode('/', trim((string)$entry), 2), 2, null);
+        $netBin = @inet_pton($net);
+        if ($netBin === false || strlen($netBin) !== strlen($bin)) {
+            continue;
+        }
+        $bits = $bits === null ? strlen($bin) * 8 : (int)$bits;
+        $bytes = intdiv($bits, 8);
+        if (substr($bin, 0, $bytes) !== substr($netBin, 0, $bytes)) {
+            continue;
+        }
+        $rest = $bits % 8;
+        if ($rest === 0 || ((ord($bin[$bytes]) ^ ord($netBin[$bytes])) & (0xFF << (8 - $rest)) & 0xFF) === 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** The connection comes from a reverse proxy listed in security.trusted_proxies (default: loopback only). */
+function from_trusted_proxy(array $config): bool
+{
+    $trusted = (array)($config['security']['trusted_proxies'] ?? ['127.0.0.1', '::1']);
+    return $trusted && ip_in_list($_SERVER['REMOTE_ADDR'] ?? '', $trusted);
+}
+
+/** Client IP. X-Forwarded-For is only believed when the request comes from a trusted proxy. */
+function client_ip(array $config): string
+{
+    $ip = (string)($_SERVER['REMOTE_ADDR'] ?? '');
+    if (from_trusted_proxy($config) && !empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        $trusted = (array)($config['security']['trusted_proxies'] ?? ['127.0.0.1', '::1']);
+        // Walk from the right (the hop closest to us) and take the first address that is not one of our proxies.
+        foreach (array_reverse(array_map('trim', explode(',', (string)$_SERVER['HTTP_X_FORWARDED_FOR']))) as $hop) {
+            if (@inet_pton($hop) === false) {
+                break;
+            }
+            $ip = $hop;
+            if (!ip_in_list($hop, $trusted)) {
+                break;
+            }
+        }
+    }
+    return $ip;
+}
+
+/** HTTPS directly, or X-Forwarded-Proto: https from a trusted proxy. */
+function is_https(array $config): bool
+{
+    if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
+        return true;
+    }
+    return from_trusted_proxy($config) && strtolower((string)($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https';
 }
 
 function rate_limit(array $config, string $label, array $tokenCfg): void
@@ -165,7 +224,8 @@ function rate_limit(array $config, string $label, array $tokenCfg): void
 function allowed_models(array $config, array $tokenCfg): array
 {
     $global = $config['images']['allowed_models'];
-    if ($global) { // local models are always allowed alongside the OpenRouter whitelist
+    // Local models obey the whitelist like any other model, unless local_images.auto_allow puts them on it.
+    if ($global && !empty($config['local_images']['auto_allow'])) {
         $global = array_values(array_unique(array_merge($global, local_models($config))));
     }
     $perToken = $tokenCfg['allowed_models'] ?? [];
@@ -195,10 +255,13 @@ function base_url(array $config): string
     if ($b !== '') {
         return $b;
     }
-    $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
-        || strtolower($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https';
-    $dir = base_path();
-    return ($https ? 'https' : 'http') . '://' . ($_SERVER['HTTP_HOST'] ?? 'localhost') . $dir;
+    // No configured URL: fall back to the request's Host header, but only if it looks like a host name, so a forged
+    // header can't put arbitrary text into links. Set output.public_base_url in production.
+    $host = (string)($_SERVER['HTTP_HOST'] ?? '');
+    if (!preg_match('/^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}\.)*[A-Za-z0-9-]{1,63}|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?$/', $host)) {
+        $host = 'localhost';
+    }
+    return (is_https($config) ? 'https' : 'http') . '://' . $host . base_path();
 }
 
 function cleanup_old_images(array $config): void
@@ -405,11 +468,24 @@ function cleanup_old_audio(array $config): void
     if ($hours <= 0 || !is_dir($dir) || random_int(1, 20) !== 1) {
         return;
     }
-    foreach (glob($dir . '/*.mp3') ?: [] as $f) {
+    foreach (glob($dir . '/*.*') ?: [] as $f) { // the mp3 files and their .owner markers
         if (is_file($f) && filemtime($f) < time() - $hours * 3600) {
             @unlink($f);
         }
     }
+}
+
+/** Records which token created a stored image/audio file, so other tokens can't fetch or reuse it. */
+function owner_mark(string $file, string $label): void
+{
+    @file_put_contents($file . '.owner', hash('sha256', $label));
+}
+
+/** Whether $label may use $file. Files without a marker (made before ownership existed) stay usable by any token. */
+function owner_ok(string $file, string $label): bool
+{
+    $owner = is_file($file . '.owner') ? trim((string)@file_get_contents($file . '.owner')) : '';
+    return $owner === '' || hash_equals($owner, hash('sha256', $label));
 }
 
 const INPUT_IMAGE_MIME = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
@@ -457,7 +533,7 @@ function image_bytes_to_data_url(array $config, string $bin, string $what): stri
  * Turns one JSON input_images entry into something OpenRouter accepts.
  * Accepts: data URL, raw base64, https URL, or a relay image (file name or /images/ URL).
  */
-function resolve_input_image(array $config, mixed $u, int $i): string
+function resolve_input_image(array $config, mixed $u, int $i, string $label): string
 {
     $what = "input_images[$i]";
     if (!is_string($u) || $u === '') {
@@ -467,7 +543,7 @@ function resolve_input_image(array $config, mixed $u, int $i): string
     if (preg_match('#(?:^|/images/)([a-f0-9]{32}\.(?:png|jpg|webp|gif))$#', $u, $m)
         && (!str_contains($u, '/') || str_starts_with($u, base_url($config) . '/images/'))) {
         $file = $config['output']['storage_dir'] . '/' . $m[1];
-        if (!is_file($file)) {
+        if (!is_file($file) || !owner_ok($file, $label)) {
             fail(422, 'invalid_input_images', "$what refers to an image that no longer exists.");
         }
         return image_bytes_to_data_url($config, (string)file_get_contents($file), $what);
@@ -599,6 +675,155 @@ function cleanup_old_jobs(array $config): void
     }
 }
 
+// ------------------------------------------------------------------ concurrency slots and daily budget
+
+function state_dir(array $config, string $sub): string
+{
+    return dirname($config['output']['storage_dir']) . '/' . $sub;
+}
+
+/**
+ * Takes one of the limited "job slots" for a generation or speech request, or terminates with 429 too_many_jobs.
+ * Every running request (sync, or an async job working after its 202) keeps a PHP worker busy, often for minutes,
+ * so without a cap a single token could occupy the whole PHP-FPM pool. Limits: security.max_concurrent_jobs (all
+ * tokens together) and the token's max_concurrent (default security.default_max_concurrent); 0 = no limit.
+ * The slot is released by respond() or, if the request dies, by a shutdown handler; slots left by a killed worker
+ * expire when the process is gone or after $maxSeconds.
+ */
+function slot_acquire(array $config, string $label, array $tokenCfg, int $maxSeconds): void
+{
+    $sec = $config['security'];
+    $global = (int)($sec['max_concurrent_jobs'] ?? 3);
+    $per = (int)($tokenCfg['max_concurrent'] ?? $sec['default_max_concurrent'] ?? 2);
+    if ($global <= 0 && $per <= 0) {
+        return;
+    }
+    $dir = state_dir($config, 'slots');
+    if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir)) {
+        log_line($config, "SLOT_ERROR dir=$dir (concurrency limit not enforced)");
+        return;
+    }
+    $lock = @fopen($dir . '/.lock', 'c');
+    if (!$lock) {
+        return;
+    }
+    flock($lock, LOCK_EX);
+    $all = 0;
+    $mine = 0;
+    $me = hash('sha256', $label);
+    foreach (glob($dir . '/*.json') ?: [] as $f) {
+        $sl = json_decode((string)@file_get_contents($f), true);
+        $gone = !is_array($sl)
+            || (!empty($sl['pid']) && is_dir('/proc/self') && !is_dir('/proc/' . (int)$sl['pid']))
+            || time() - (int)($sl['created'] ?? 0) > (int)($sl['max'] ?? 3600) + 300;
+        if ($gone) {
+            @unlink($f);
+            continue;
+        }
+        $all++;
+        if (($sl['owner'] ?? '') === $me) {
+            $mine++;
+        }
+    }
+    if (($global > 0 && $all >= $global) || ($per > 0 && $mine >= $per)) {
+        flock($lock, LOCK_UN);
+        fclose($lock);
+        log_line($config, "BUSY label=$label running=$all mine=$mine limit_global=$global limit_token=$per");
+        header('Retry-After: 30');
+        fail(429, 'too_many_jobs', $per > 0 && $mine >= $per
+            ? "This token already has $mine request(s) running; wait for one to finish."
+            : 'The relay is busy with other requests; try again shortly.', ['retry_after' => 30]);
+    }
+    $file = $dir . '/' . bin2hex(random_bytes(8)) . '.json';
+    @file_put_contents($file, json_encode(['owner' => $me, 'pid' => getmypid(), 'created' => time(), 'max' => $maxSeconds]));
+    flock($lock, LOCK_UN);
+    fclose($lock);
+    $GLOBALS['relay_slot'] = $file;
+    register_shutdown_function('slot_release');
+}
+
+function slot_release(): void
+{
+    if (isset($GLOBALS['relay_slot'])) {
+        @unlink($GLOBALS['relay_slot']);
+        unset($GLOBALS['relay_slot']);
+    }
+}
+
+/** Daily spending limit in USD for a token (its daily_budget, else security.default_daily_budget); 0 = none. */
+function budget_limit(array $config, array $tokenCfg): float
+{
+    return max(0.0, (float)($tokenCfg['daily_budget'] ?? $config['security']['default_daily_budget'] ?? 0));
+}
+
+/** USD a token has spent today (UTC day). */
+function budget_read(array $config, string $label): float
+{
+    $f = state_dir($config, 'budget') . '/' . hash('sha256', $label) . '.json';
+    $b = is_file($f) ? json_decode((string)@file_get_contents($f), true) : null;
+    return is_array($b) && ($b['day'] ?? '') === gmdate('Y-m-d') ? (float)($b['spent'] ?? 0) : 0.0;
+}
+
+/** Refuses the request (429 budget_exceeded) once the token has spent its daily budget. Checked before any paid call. */
+function budget_check(array $config, string $label, array $tokenCfg): void
+{
+    $limit = budget_limit($config, $tokenCfg);
+    if ($limit <= 0) {
+        return;
+    }
+    $spent = budget_read($config, $label);
+    if ($spent >= $limit) {
+        $retry = 86400 - (time() % 86400); // until UTC midnight
+        log_line($config, "BUDGET label=$label spent=" . round($spent, 4) . " limit=$limit");
+        header('Retry-After: ' . $retry);
+        fail(429, 'budget_exceeded', 'This token has used its daily budget; it resets at 00:00 UTC.', ['retry_after' => $retry]);
+    }
+}
+
+/**
+ * Adds what OpenRouter billed for a request to the token's daily total (called for every outcome, also rejections
+ * after a paid screening). Requests already running when the limit is reached still finish, so it can overshoot a little.
+ */
+function budget_add(array $config, string $label, ?float $cost): void
+{
+    if ($cost === null || $cost <= 0) {
+        return;
+    }
+    $dir = state_dir($config, 'budget');
+    if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir)) {
+        return;
+    }
+    $fh = @fopen($dir . '/' . hash('sha256', $label) . '.json', 'c+');
+    if (!$fh) {
+        return;
+    }
+    flock($fh, LOCK_EX);
+    $b = json_decode(stream_get_contents($fh) ?: '', true);
+    $day = gmdate('Y-m-d');
+    $spent = (is_array($b) && ($b['day'] ?? '') === $day ? (float)($b['spent'] ?? 0) : 0.0) + $cost;
+    ftruncate($fh, 0);
+    rewind($fh);
+    fwrite($fh, json_encode(['day' => $day, 'spent' => $spent]));
+    flock($fh, LOCK_UN);
+    fclose($fh);
+}
+
+/**
+ * Drops a "Require all denied" .htaccess into every runtime directory (Apache only; nginx never serves files from
+ * here). The repository ships storage/.htaccess too; this covers storage paths moved elsewhere in config.php.
+ */
+function protect_storage(array $config): void
+{
+    $out = $config['output'];
+    $dirs = [dirname($out['storage_dir']), $out['storage_dir'], $out['audio_dir'] ?? null,
+        $config['security']['rate_limit_dir'] ?? null, !empty($config['log_file']) ? dirname($config['log_file']) : null];
+    foreach (array_unique(array_filter($dirs)) as $d) {
+        if (is_dir($d) && !is_file($d . '/.htaccess') && realpath($d) !== realpath(__DIR__)) {
+            @file_put_contents($d . '/.htaccess', "Require all denied\n");
+        }
+    }
+}
+
 // ------------------------------------------------------------------ history (unadvertised viewer)
 
 function history_dir(array $config): string
@@ -714,7 +939,7 @@ function turnstile_verify(array $config, string $response): bool
         CURLOPT_POSTFIELDS => http_build_query([
             'secret' => $config['turnstile']['secret_key'],
             'response' => $response,
-            'remoteip' => $_SERVER['REMOTE_ADDR'] ?? '',
+            'remoteip' => client_ip($config),
         ]),
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_TIMEOUT => 10,
@@ -725,10 +950,51 @@ function turnstile_verify(array $config, string $response): bool
     return is_array($j) && ($j['success'] ?? false) === true;
 }
 
-function history_is_https(): bool
+/**
+ * Failed /history sign-ins per client IP: after security.viewer_login_attempts failures (default 10) within
+ * viewer_login_window seconds (default 900) further attempts get 429 until the window has passed.
+ */
+function login_throttle_file(array $config): string
 {
-    return (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
-        || strtolower($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https';
+    return state_dir($config, 'ratelimit') . '/login_' . hash('sha256', client_ip($config)) . '.json';
+}
+
+function login_throttle_check(array $config): void
+{
+    $max = (int)($config['security']['viewer_login_attempts'] ?? 10);
+    $window = max(60, (int)($config['security']['viewer_login_window'] ?? 900));
+    $f = login_throttle_file($config);
+    $times = is_file($f) ? (json_decode((string)@file_get_contents($f), true) ?: []) : [];
+    $times = array_values(array_filter((array)$times, fn($t) => is_numeric($t) && $t > time() - $window));
+    if ($max > 0 && count($times) >= $max) {
+        $retry = max(1, (int)min($times) + $window - time());
+        log_line($config, 'DENY ip=' . client_ip($config) . ' reason=viewer_login_throttled');
+        header('Retry-After: ' . $retry);
+        history_html('Sign in', '<h1>Sign in</h1><p class="mut">Too many failed attempts. Try again in '
+            . ceil($retry / 60) . ' minute(s).</p>', 429);
+    }
+}
+
+function login_throttle_fail(array $config): void
+{
+    $dir = state_dir($config, 'ratelimit');
+    if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir)) {
+        return;
+    }
+    $window = max(60, (int)($config['security']['viewer_login_window'] ?? 900));
+    $fh = @fopen(login_throttle_file($config), 'c+');
+    if (!$fh) {
+        return;
+    }
+    flock($fh, LOCK_EX);
+    $times = json_decode(stream_get_contents($fh) ?: '[]', true) ?: [];
+    $times = array_values(array_filter((array)$times, fn($t) => is_numeric($t) && $t > time() - $window));
+    $times[] = time();
+    ftruncate($fh, 0);
+    rewind($fh);
+    fwrite($fh, json_encode($times));
+    flock($fh, LOCK_UN);
+    fclose($fh);
 }
 
 function history_html(string $title, string $body, int $status = 200, string $script = '', bool $turnstile = false): never
@@ -740,7 +1006,7 @@ function history_html(string $title, string $body, int $status = 200, string $sc
     header('X-Content-Type-Options: nosniff');
     header('X-Frame-Options: DENY');
     header('Referrer-Policy: no-referrer');
-    header("Content-Security-Policy: default-src 'none'; img-src 'self' https: data:; media-src 'self'; style-src 'unsafe-inline'; form-action 'self'"
+    header("Content-Security-Policy: default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; form-action 'self'"
         . ($turnstile ? "; script-src https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com" : ($script !== '' ? "; script-src 'nonce-$nonce'" : '')));
     header('X-Robots-Tag: noindex, nofollow');
     $t = htmlspecialchars($title, ENT_QUOTES);
@@ -766,7 +1032,7 @@ function history_html(string $title, string $body, int $status = 200, string $sc
         . '.lb .bar{color:#eee;font-size:13px;margin-top:8px;display:flex;gap:16px;align-items:center}.lb .bar a{color:#9cf}'
         . '.lb button{background:rgba(255,255,255,.14);color:#fff;border:0;border-radius:6px;padding:4px 12px;cursor:pointer}'
         . 'audio{display:block;margin-top:8px;width:100%;max-width:420px}'
-        . '.imgs a{cursor:zoom-in}.withheld{width:260px;border:1px dashed #d33;border-radius:6px;padding:8px;font-size:12px;background:var(--card)}'
+        . '.imgs a.zoom{cursor:zoom-in}.extlink a{display:block;width:200px;padding:10px;border:1px dashed var(--line);border-radius:6px;font-size:12px;word-break:break-all}.withheld{width:260px;border:1px dashed #d33;border-radius:6px;padding:8px;font-size:12px;background:var(--card)}'
         . '.withheld summary{cursor:pointer;font-weight:600;color:#d33}.withheld details div{margin-top:6px;word-break:break-all}'
         . '</style></head><body><main>' . $body . '</main>'
         . ($script !== '' ? '<script nonce="' . $nonce . '">' . $script . '</script>' : '') . '</body></html>';
@@ -835,30 +1101,33 @@ function history_handle(array $config, string $method, string $path): never
     if ($path === '/history' && $method === 'POST') {
         if (!empty($_POST['logout'])) {
             setcookie(HISTORY_COOKIE, '', ['expires' => 1, 'path' => $self, 'httponly' => true, 'samesite' => 'Strict',
-                'secure' => history_is_https()]);
+                'secure' => is_https($config)]);
             header('Location: ' . $self);
             http_response_code(303);
             exit;
         }
+        login_throttle_check($config);
         $tok = is_string($_POST['token'] ?? null) ? trim($_POST['token']) : '';
         if (turnstile_enabled($config)) {
             $cf = is_string($_POST['cf-turnstile-response'] ?? null) ? $_POST['cf-turnstile-response'] : '';
             if (!turnstile_verify($config, $cf)) {
+                login_throttle_fail($config);
                 usleep(max(0, (int)$config['security']['failed_auth_delay_ms']) * 1000);
-                log_line($config, 'DENY ip=' . ($_SERVER['REMOTE_ADDR'] ?? '') . ' reason=turnstile_failed');
+                log_line($config, 'DENY ip=' . client_ip($config) . ' reason=turnstile_failed');
                 history_html('Sign in', '<h1>Sign in</h1><p class="mut">Captcha check failed. Please try again.</p>'
                     . history_login_form($self, $config), 401, '', true);
             }
         }
         if (viewer_token_ok($config, $tok)) {
             setcookie(HISTORY_COOKIE, $tok, ['expires' => time() + 7 * 86400, 'path' => $self, 'httponly' => true,
-                'samesite' => 'Strict', 'secure' => history_is_https()]);
+                'samesite' => 'Strict', 'secure' => is_https($config)]);
             header('Location: ' . $self);
             http_response_code(303);
             exit;
         }
+        login_throttle_fail($config);
         usleep(max(0, (int)$config['security']['failed_auth_delay_ms']) * 1000);
-        log_line($config, 'DENY ip=' . ($_SERVER['REMOTE_ADDR'] ?? '') . ' reason=bad_viewer_token');
+        log_line($config, 'DENY ip=' . client_ip($config) . ' reason=bad_viewer_token');
         history_html('Sign in', '<h1>Sign in</h1><p class="mut">Invalid token.</p>' . history_login_form($self, $config), 401, '', turnstile_enabled($config));
     }
 
@@ -942,12 +1211,20 @@ function history_handle(array $config, string $method, string $path): never
     }
 
     $fig = function (array $it, string $cap) use ($self, $h): string {
-        $src = isset($it['blob']) ? $self . '/img/' . $it['blob'] : ($it['url'] ?? '');
-        if ($src === '') {
+        if (isset($it['blob'])) {
+            $src = $self . '/img/' . $it['blob'];
+            return '<figure><a class="zoom" href="' . $h($src) . '"><img loading="lazy" src="' . $h($src) . '" alt="' . $h($cap) . '"></a>'
+                . '<figcaption>' . $h($cap) . '</figcaption></figure>';
+        }
+        $url = (string)($it['url'] ?? '');
+        if ($url === '') {
             return '';
         }
-        return '<figure><a href="' . $h($src) . '"><img loading="lazy" src="' . $h($src) . '" alt="' . $h($cap) . '"></a>'
-            . '<figcaption>' . $h($cap) . '</figcaption></figure>';
+        // A link supplied by a client or hosted elsewhere is never loaded automatically: that would reveal the viewer's
+        // IP to whoever runs that server (and show whatever they choose to serve).
+        $host = (string)(parse_url($url, PHP_URL_HOST) ?: 'external site');
+        return '<figure class="extlink"><a href="' . $h($url) . '" target="_blank" rel="noopener noreferrer">external image<br>'
+            . $h($host) . '</a><figcaption>' . $h($cap) . ' (link, not loaded)</figcaption></figure>';
     };
 
     $out = '<h1>Generation history</h1><div class="meta"><span>' . $total . ' entries</span><span>total cost $'
@@ -1030,7 +1307,7 @@ function history_handle(array $config, string $method, string $path): never
   if (document.querySelector('.card.pending')) {
     setInterval(function () { if (!lbOpen() && !document.hidden) location.reload(); }, 15000);
   }
-  var links = Array.prototype.slice.call(document.querySelectorAll('.imgs a'));
+  var links = Array.prototype.slice.call(document.querySelectorAll('.imgs a.zoom'));
   if (!links.length) return;
   var lb = document.createElement('div');
   lb.className = 'lb';
@@ -1246,6 +1523,7 @@ if ($base !== '' && str_starts_with($path, $base)) {
     $path = substr($path, strlen($base));
 }
 $path = '/' . trim(preg_replace('#^/index\.php#', '', $path), '/');
+protect_storage($config);
 
 if ($path === '/health' && ($method === 'GET' || $method === 'HEAD')) {
     respond(200, ['ok' => true, 'status' => 'up']);
@@ -1255,14 +1533,15 @@ if ($path === '/howto' && ($method === 'GET' || $method === 'HEAD')) {
     howto_page($config);
 }
 
-// Debug page: rendered as-is (its own proxy calls come back through here as /live_test_page_99?a=...), no API token.
-if ($path === '/live_test_page_99' && ($method === 'GET' || $method === 'HEAD' || $method === 'POST')) {
+// Debug pages: the outer page needs no token; the form inside (?ui=1) and every API call the browser then makes
+// go through the normal token check.
+if ($path === '/live_test_page_99' && ($method === 'GET' || $method === 'HEAD')) {
     require __DIR__ . '/test.php';
     exit;
 }
 
 // Same for the speech variant.
-if ($path === '/live_test_page_89' && ($method === 'GET' || $method === 'HEAD' || $method === 'POST')) {
+if ($path === '/live_test_page_89' && ($method === 'GET' || $method === 'HEAD')) {
     require __DIR__ . '/test_speech.php';
     exit;
 }
@@ -1329,7 +1608,7 @@ if ($method === 'GET' && preg_match('#^/jobs/([a-f0-9]{32})$#', $path, $m)) {
 // ---- GET /images/{file}
 if ($method === 'GET' && preg_match('#^/images/([a-f0-9]{32}\.(?:png|jpg|webp|gif))$#', $path, $m)) {
     $file = $config['output']['storage_dir'] . '/' . $m[1];
-    if (!is_file($file)) {
+    if (!is_file($file) || !owner_ok($file, $label)) {
         fail(404, 'not_found', 'Image not found or expired.');
     }
     $types = ['png' => 'image/png', 'jpg' => 'image/jpeg', 'webp' => 'image/webp', 'gif' => 'image/gif'];
@@ -1373,7 +1652,7 @@ if ($path === '/generate' && $method === 'POST') {
         }
     }
 
-    foreach (['prompt', 'model', 'aspect_ratio', 'response_mode'] as $field) {
+    foreach (['prompt', 'model', 'aspect_ratio', 'response_mode', 'quality'] as $field) {
         if (isset($body[$field]) && !is_string($body[$field])) {
             fail(422, 'invalid_' . $field, '"' . $field . '" must be a string.');
         }
@@ -1396,10 +1675,13 @@ if ($path === '/generate' && $method === 'POST') {
     $screenCost = null; // what the screening calls cost, added to this request's history entry
     $screen = null;     // Jev's verdict for this prompt (null when the second opinion did not run)
     $imageScreens = []; // Clef's verdicts for the reference images
+    // Per token, "moderation" => false skips the prompt checks (keywords + Jev) and "image_check" => false skips the
+    // reference-image check; each is independent of the other.
     $modActive = !empty($mod['enabled']) && ($tokenCfg['moderation'] ?? true) !== false;
+    $imgCheckActive = !empty($mod['enabled']) && !empty($mod['image_check']['enabled']) && ($tokenCfg['image_check'] ?? true) !== false;
     // Async + a slow check (Jev / Clef) enabled: answer with a job id at once and run ALL checks inside the job, so
     // the client never waits for them and a rejection (which says nothing about the cause) arrives via /jobs/{id}.
-    $deferScreen = $async && $modActive && (!empty($mod['second_opinion']['enabled']) || !empty($mod['image_check']['enabled']));
+    $deferScreen = $async && (($modActive && !empty($mod['second_opinion']['enabled'])) || $imgCheckActive);
     $screenReject = function (string $code, string $message) use ($deferScreen, $mod): never {
         if ($deferScreen) {
             fail(422, 'request_rejected', (string)($mod['async_message'] ?? 'The request could not be accepted.'));
@@ -1428,6 +1710,7 @@ if ($path === '/generate' && $method === 'POST') {
             // The client only learns that it was rejected; the matched rule stays in the operator's log/history.
             log_line($config, "MODERATION label=$label model=$model rule=" . json_encode($hit['rule'], JSON_UNESCAPED_UNICODE)
                 . " via={$hit['variant']}");
+            budget_add($config, $label, $screenCost);
             history_record($config, [
                 'status' => 'rejected',
                 'label' => $label,
@@ -1443,9 +1726,6 @@ if ($path === '/generate' && $method === 'POST') {
         }
     }
     };
-    if (!$deferScreen) {
-        $screenPrompt();
-    }
     $allowed = allowed_models($config, $tokenCfg);
     if ($allowed && !in_array($model, $allowed, true)) {
         $why = isset($body['model'])
@@ -1509,7 +1789,7 @@ if ($path === '/generate' && $method === 'POST') {
             $content[] = ['type' => 'image_url', 'image_url' => ['url' => $u]];
         }
         foreach ($inputs as $i => $u) {
-            $content[] = ['type' => 'image_url', 'image_url' => ['url' => resolve_input_image($config, $u, $i)]];
+            $content[] = ['type' => 'image_url', 'image_url' => ['url' => resolve_input_image($config, $u, $i, $label)]];
         }
     }
 
@@ -1542,8 +1822,8 @@ if ($path === '/generate' && $method === 'POST') {
 
     // Optional image screening (Clef): every reference image is inspected before anything is generated.
     $ic = $mod['image_check'] ?? [];
-    $screenImages = function () use (&$screen, &$screenCost, &$imageScreens, $config, $mod, $ic, $modActive, $label, $model, $prompt, $refs, $screenReject): void {
-    if ($refs && $modActive && !empty($ic['enabled'])) {
+    $screenImages = function () use (&$screen, &$screenCost, &$imageScreens, $config, $mod, $ic, $imgCheckActive, $label, $model, $prompt, $refs, $screenReject): void {
+    if ($refs && $imgCheckActive) {
         $chk = moderation_check_images($config, $ic, array_map(fn($r) => (string)$r['image_url']['url'], $refs));
         $screenCost = ($screenCost ?? 0.0) + $chk['cost'];
         $worst = null; // highest probability among the "not safe" results
@@ -1575,7 +1855,7 @@ if ($path === '/generate' && $method === 'POST') {
             if ($chk['flagged'] && ($ic['quarantine']['enabled'] ?? true)) {
                 foreach ($chk['flagged'] as $fi) {
                     $q = quarantine_store_data_url($config, (string)$refs[$fi - 1]['image_url']['url'], [
-                        'label' => $label, 'ip' => $_SERVER['REMOTE_ADDR'] ?? '', 'model' => $model,
+                        'label' => $label, 'ip' => client_ip($config), 'model' => $model,
                         'image_index' => $fi, 'prompt' => mb_substr($prompt, 0, 500),
                     ]);
                     if ($q !== null) {
@@ -1586,6 +1866,7 @@ if ($path === '/generate' && $method === 'POST') {
                     }
                 }
             }
+            budget_add($config, $label, $screenCost);
             history_record($config, [
                 'status' => 'rejected',
                 'label' => $label,
@@ -1604,7 +1885,16 @@ if ($path === '/generate' && $method === 'POST') {
         }
     }
     };
+    // Everything free has been validated by now, so the paid checks below are never spent on a request that would
+    // fail anyway. Budget and concurrency come first: a token over its limit pays for nothing.
+    budget_check($config, $label, $tokenCfg);
+    $jobMax = max_job_seconds($config, $n, $localEp) + ($deferScreen ? 180 : 0);
+    slot_acquire($config, $label, $tokenCfg, $jobMax + 60);
+    if (!$async) {
+        set_time_limit($jobMax + 150); // all images and retries, plus the screening calls (async jobs set their own)
+    }
     if (!$deferScreen) {
+        $screenPrompt();
         $screenImages();
     }
 
@@ -1615,7 +1905,6 @@ if ($path === '/generate' && $method === 'POST') {
             log_line($config, "STORAGE_ERROR dir=$dir");
             fail(500, 'storage_error', 'Image storage directory is not writable. Fix permissions, or use response_mode "base64".');
         }
-        @file_put_contents(dirname($dir) . '/.htaccess', "Require all denied\n");
         cleanup_old_images($config);
     }
 
@@ -1645,7 +1934,6 @@ if ($path === '/generate' && $method === 'POST') {
         $jobId = bin2hex(random_bytes(16));
         $jobFile = $jobsDir . '/' . $jobId . '.json';
         $created = time();
-        $jobMax = max_job_seconds($config, $n, $localEp) + ($deferScreen ? 180 : 0);
         $wait = check_back_seconds($config, $localEp);
         job_write($jobFile, ['label' => $label, 'created' => $created, 'status' => $deferScreen ? 'screening' : 'running']
             + ($isLocal ? ['max_seconds' => $jobMax, 'check_back' => $wait] : []));
@@ -1724,6 +2012,7 @@ if ($path === '/generate' && $method === 'POST') {
         if ($screenCost !== null) {
             $costs[] = $screenCost; // the screening call is billed too
         }
+        budget_add($config, $label, $costs ? (float)array_sum($costs) : null);
         history_record($config, [
             'status' => $outcome,
             'label' => $label,
@@ -1877,6 +2166,7 @@ if ($path === '/generate' && $method === 'POST') {
             if ($mode !== 'base64') {
                 $name = bin2hex(random_bytes(16)) . '.' . $ext;
                 if (file_put_contents($dir . '/' . $name, $bin) === strlen($bin)) {
+                    owner_mark($dir . '/' . $name, $label);
                     $item['file'] = $name;
                     $item['url'] = base_url($config) . '/images/' . $name;
                 } else {
@@ -1911,7 +2201,7 @@ if ($path === '/generate' && $method === 'POST') {
 // ---- GET /audio/{file}
 if ($method === 'GET' && preg_match('#^/audio/([a-f0-9]{32}\.mp3)$#', $path, $m)) {
     $file = ($config['output']['audio_dir'] ?? '') . '/' . $m[1];
-    if (!is_file($file)) {
+    if (!is_file($file) || !owner_ok($file, $label)) {
         fail(404, 'not_found', 'Audio not found or expired.');
     }
     header('Content-Type: audio/mpeg');
@@ -1931,7 +2221,7 @@ if ($path === '/speech' && $method === 'POST') {
     if (!is_array($body)) {
         fail(400, 'invalid_json', 'Request body must be a JSON object.');
     }
-    foreach (['input', 'model', 'voice', 'response_mode'] as $field) {
+    foreach (['input', 'text', 'model', 'voice', 'response_mode'] as $field) {
         if (isset($body[$field]) && !is_string($body[$field])) {
             fail(422, 'invalid_' . $field, '"' . $field . '" must be a string.');
         }
@@ -1996,6 +2286,9 @@ if ($path === '/speech' && $method === 'POST') {
     $upConfig = $config;
     $upConfig['openrouter']['timeout'] = (int)($async ? ($sp['async_timeout'] ?? 900) : ($sp['timeout'] ?? 120));
     $histBase['mode'] = $async ? 'async' : 'sync';
+    // Speech responses carry no cost, so nothing is added to the budget, but a token that is over it is still refused.
+    budget_check($config, $label, $tokenCfg);
+    slot_acquire($config, $label, $tokenCfg, max_job_seconds($upConfig, 1) + 60);
     if ($async) {
         $jobsDir = jobs_dir($config);
         if (!is_dir($jobsDir) && !@mkdir($jobsDir, 0775, true) && !is_dir($jobsDir)) {
@@ -2071,6 +2364,7 @@ if ($path === '/speech' && $method === 'POST') {
         cleanup_old_audio($config);
         $name = bin2hex(random_bytes(16)) . '.mp3';
         if (file_put_contents($dir . '/' . $name, $raw) === strlen($raw)) {
+            owner_mark($dir . '/' . $name, $label);
             $item['file'] = $name;
             $item['url'] = base_url($config) . '/audio/' . $name;
         } else {

@@ -524,6 +524,7 @@ function quarantine_key(array $config): ?string
             if (!is_dir($dir) && !@mkdir($dir, 0700, true) && !is_dir($dir)) {
                 return null;
             }
+            @file_put_contents($dir . '/.htaccess', "Require all denied\n"); // never web-served, even on Apache
             if (@file_put_contents($file, bin2hex(random_bytes(32)), LOCK_EX) === false) {
                 return null;
             }

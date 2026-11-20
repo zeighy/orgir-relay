@@ -242,7 +242,6 @@ if (isset($_GET['ui'])) {
 </style>
 </head>
 <body>
-<h1>Relay test</h1>
 <div id="bar"><h1>Relay test</h1><button type="button" class="s" id="logout" hidden>Clear token (log out)</button></div>
 <form id="login" hidden>
   <label for="token">Token</label>
