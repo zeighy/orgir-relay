@@ -6,8 +6,14 @@ Small PHP API that lets a Claude skill generate images through OpenRouter withou
 1. PHP 8.1+ with the `curl` and `mbstring` extensions (Ubuntu: `apt install php-cli php-curl php-mbstring`).
 2. Copy `config.example.php` to `config.php` and edit it (or set the `OPENROUTER_API_KEY` env var). Set models, limits, output mode.
 3. Create a token: `php bin/make-token.php claude-skill` and paste the printed entry into `security.tokens`.
-4. Run locally: `php -S 127.0.0.1:8080 index.php`, or deploy on Apache (`.htaccess` included) or nginx (see below).
-5. Put it behind HTTPS in production and set `require_https` to `true`.
+4. Run locally: `PHP_CLI_SERVER_WORKERS=4 php -S 127.0.0.1:8080 index.php`, or deploy on Apache (`.htaccess` included) or nginx (see below). Without `PHP_CLI_SERVER_WORKERS` the built-in server handles one request at a time, so a running async job blocks every other request, including its own polls.
+5. Put it behind HTTPS in production, set `require_https` to `true` and set `output.public_base_url` (otherwise download links are built from the request's `Host` header).
+
+### Apache
+The `.htaccess` sends every request to `index.php` and refuses every other file, so `config.php`, `storage/`, `bin/`, `skill/` and `.git/` are never served even when they sit inside the document root. It needs `mod_rewrite` and `AllowOverride FileInfo AuthConfig`. `storage/.htaccess` (`Require all denied`) is shipped as a second layer, and the relay writes the same file into any storage directory you move elsewhere in `config.php`.
+
+### Capacity
+Every generation or speech request keeps a PHP worker busy for as long as it runs, and async jobs do too after they've returned their `202` (often for minutes). `security.max_concurrent_jobs` (all tokens, default 3) and `security.default_max_concurrent` / per-token `max_concurrent` (default 2) cap how many run at once; over the cap the relay answers `429 too_many_jobs`. Keep `max_concurrent_jobs` below PHP-FPM's `pm.max_children` so polls, `/models` and downloads are still answered while jobs run. `security.default_daily_budget` / per-token `daily_budget` set a spending cap in USD per UTC day, based on the cost OpenRouter reports (images and screening calls; speech reports no cost). Over the cap the relay answers `429 budget_exceeded` until midnight UTC. Requests already running still finish, so the total can overshoot a little.
 
 ## nginx
 nginx has no `.htaccess`, and its paths can't be relative to the app, so generate the server block from wherever the app is installed:
@@ -15,7 +21,7 @@ nginx has no `.htaccess`, and its paths can't be relative to the app, so generat
 bin/nginx-conf.sh relay.example.com | sudo tee /etc/nginx/sites-available/relay
 sudo ln -s ../sites-available/relay /etc/nginx/sites-enabled/ && sudo nginx -t && sudo systemctl reload nginx
 ```
-Optional: a URL prefix (`bin/nginx-conf.sh example.com /relay`), `--http` for plain HTTP (local or behind a TLS proxy), and env overrides `PHP_FPM`, `SSL_CERT`, `SSL_KEY`, `MAX_BODY`. The PHP-FPM socket is detected from `/run/php`. Every request goes to `index.php` and no files are served from disk, so `config.php`, `storage/` and `bin/` are never exposed. PHP-FPM needs write access to `storage/` and the `OPENROUTER_API_KEY` env var (`env[...]` in the pool config) or the key in `config.php`.
+Optional: a URL prefix (`bin/nginx-conf.sh example.com /relay`), `--http` for plain HTTP (local or behind a TLS proxy), and env overrides `PHP_FPM`, `SSL_CERT`, `SSL_KEY`, `MAX_BODY`, `READ_TIMEOUT` (default `3600s`: a synchronous `/generate` can take that long with several images, retries or slow local models; keep PHP-FPM's `request_terminate_timeout` at least as high, or have clients use `"async": true`). The PHP-FPM socket is detected from `/run/php`. Every request goes to `index.php` and no files are served from disk, so `config.php`, `storage/` and `bin/` are never exposed. PHP-FPM needs write access to `storage/` and the `OPENROUTER_API_KEY` env var (`env[...]` in the pool config) or the key in `config.php`.
 
 ## API
 | Route | Auth | Description |
@@ -28,6 +34,7 @@ Optional: a URL prefix (`bin/nginx-conf.sh example.com /relay`), `--http` for pl
 | `GET /audio/{file}` | yes | download saved speech |
 | `GET /howto` | no | human-readable usage guide (how to generate images and speech) |
 | `GET /history` | viewer token | unadvertised history viewer: prompts, results, cost and screening verdicts. Needs a separate viewer token (`php bin/make-token.php "viewer" --viewer`), set in `security.viewer_tokens`. Sign-in can be protected with Cloudflare Turnstile (`turnstile` in `config.php`) |
+| `GET /jobs/{id}` | yes (same token) | status/result of an async job |
 | `GET /live_test_page_99` | token entered in page | manual test page for image generation (`test.php`) |
 | `GET /live_test_page_89` | token entered in page | manual test page for speech (`test_speech.php`) |
 
@@ -44,9 +51,13 @@ location ~ ^/(relay/)?(history|live_test_page_\d+) {
 }
 ```
 
-Keep the API routes (`/generate`, `/speech`, ...) public only if clients need them. If you must expose `/history`, enable Turnstile and use a long random viewer token.
+Keep the API routes (`/generate`, `/speech`, ...) public only if clients need them. If you must expose `/history`, enable Turnstile and use a long random viewer token. Failed `/history` sign-ins are limited per IP (`security.viewer_login_attempts` within `viewer_login_window` seconds, default 10 per 15 minutes; then `429`). `/history` never loads external images: reference or result images that are only links appear as a link you can open yourself, so viewing the page doesn't reveal your IP to whoever hosts them.
 
-Security: bearer tokens stored only as SHA-256 hashes, constant-time comparison, per-token rate limit / model restrictions / expiry, optional IP allowlist, auth-failure delay, images served only through authenticated route, `config.php` and `storage/` blocked from the web.
+Security: bearer tokens stored only as SHA-256 hashes, constant-time comparison, per-token rate limit / concurrency limit / daily budget / model restrictions / expiry, optional IP allowlist (exact IPs or CIDR ranges), auth-failure delay. Images and audio are served only through authenticated routes and only to the token that created them (the same applies when one is reused as a reference). `config.php` and `storage/` are blocked from the web.
+
+**Behind a reverse proxy:** `X-Forwarded-For` and `X-Forwarded-Proto` are only believed when the connection comes from `security.trusted_proxies` (default: loopback only). This affects `ip_allowlist`, `require_https`, the IPs in logs and quarantine records, and the scheme of generated links. If your proxy or load balancer is on another host, add its address or range there; otherwise the relay sees the proxy's IP as the client and treats requests as plain HTTP.
+
+Per-token options in `security.tokens`: `enabled`, `expires`, `rate_limit` (requests/minute), `max_concurrent`, `daily_budget` (USD), `allowed_models`, `moderation` (`false` skips the prompt checks) and `image_check` (`false` skips the reference-image check).
 
 Test:
 ```
@@ -72,6 +83,8 @@ Everything is under `moderation` in `config.php` and is **off by default** (`mod
 2. **Second opinion on the prompt** (`moderation.second_opinion`, optional). Asks TypeSafe's Jev decision model on OpenRouter whether the prompt requests sexual content. Only runs if the keyword check passed. Rejects at or above `threshold`; `on_error` chooses fail open (`allow`) or fail closed (`reject`). Costs a fraction of a cent per prompt, billed to your OpenRouter key. Test with `php bin/check-prompt.php --second-opinion "..."`.
 3. **Reference image inspection** (`moderation.image_check`, optional). Every uploaded or inline reference image is checked with Cloudflare's Clef model (`cloudflare/clef-flash` or the larger `cloudflare/clef`) through OpenRouter's Decisions API. The first image scoring at or above `threshold` rejects the request with error code `image_rejected`. Several images are checked in one batched request (images are shrunk to fit, which needs GD or Imagick); if the set is flagged, each image is re-checked alone to find the offender. `https` image links can't be inspected, so `url_images` decides whether they are rejected (default) or allowed unchecked. The `question` is editable; by default swimwear, underwear, non-sexual toplessness and artistic nudity pass, and anything sexualising a minor never does. Test with `php bin/check-image.php photo.jpg`.
 
+Per token, `"moderation" => false` skips the prompt checks (steps 1 and 2) and `"image_check" => false` skips step 3; they are independent. In synchronous requests the paid checks (2 and 3) only run after the free validation (model, `n`, aspect ratio, reference images, budget, concurrency) has passed, so invalid requests cost nothing.
+
 What callers see: only the generic `moderation.message` / `image_check.message` (or `async_message` for async jobs, where the job status becomes `rejected`). The matched rule, score and who sent it appear only in `relay.log` and `/history`. Speech requests skip the keyword filter unless both `moderation.enabled` and `speech.moderation` are true.
 
 ### Quarantined reference images
@@ -95,7 +108,7 @@ php bin/quarantine.php purge                 # delete items older than retention
 If the fallback files are unreadable by your user, re-run `export` with `sudo`. `export` verifies the SHA-256 against the record and warns on a mismatch. Delete exported files when you're done. Quarantined images may be illegal to keep or view in some jurisdictions (for example, if they depict minors), so check your local obligations before exporting, and prefer `delete` where retention isn't required.
 
 ## Claude skill
-`skill/image-gen/` holds the skill: `SKILL.md` plus `relay.sh`, which calls the relay and saves the images without exposing the token.
+`skill/image-gen/` holds the skill: `SKILL.md` plus `relay.sh`, which calls the relay and saves the images without exposing the token. `relay.sh` needs `bash`, `curl` and `python3`.
 - **Claude Code:** copy the folder to `~/.claude/skills/image-gen/` and set `IMAGE_RELAY_URL` / `IMAGE_RELAY_TOKEN` in the `env` section of `~/.claude/settings.json`.
 - **Claude web / desktop:** copy `relay.env.example` to `relay.env` in the folder and fill in a dedicated token (with `rate_limit`, `allowed_models` and `expires`). Then zip the folder (`zip -r image-gen.zip image-gen`), upload it under Settings → Capabilities → Skills, and allow network egress to the relay's domain.
 
@@ -105,7 +118,7 @@ If the fallback files are unreadable by your user, re-run `export` with `sudo`. 
 
 ## Local image generation (mlx-serve, ComfyUI middleware)
 
-If the requested `model` is listed under one of `local_images.endpoints` (`config.php`), `/generate` is sent to that endpoint's OpenAI-compatible `POST {base_url}/images/generations` instead of OpenRouter; any other model goes to OpenRouter exactly as before (OpenRouter settings, retries and timeouts are not touched). Different models can live on different servers or ports. Local models are allowed automatically (per-token `allowed_models` still apply) and are listed in `GET /models` (`local_models`, plus `local_model_info` with each model's quality levels, reference-image support and image cap).
+If the requested `model` is listed under one of `local_images.endpoints` (`config.php`), `/generate` is sent to that endpoint's OpenAI-compatible `POST {base_url}/images/generations` instead of OpenRouter; any other model goes to OpenRouter exactly as before (OpenRouter settings, retries and timeouts are not touched). Different models can live on different servers or ports. Local models follow `images.allowed_models` like any other model: list them there, or set `local_images.auto_allow => true` to add all of them automatically (per-token `allowed_models` still apply). They are listed in `GET /models` (`local_models`, plus `local_model_info` with each model's quality levels, reference-image support and image cap).
 
 Each endpoint has `base_url`, optional `api_key`, `models`, and may override any shared `local_images` key:
 

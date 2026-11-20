@@ -77,14 +77,30 @@ if not j.get("ok"):
     e = j.get("error", {})
     extra = f" (retry after {e['retry_after']}s)" if "retry_after" in e else ""
     allowed = f" allowed: {e['allowed']}" if "allowed" in e else ""
-    said = f"\nmodel_text: {e['model_text']}" if e.get("model_text") else ""
-    said += f"\nopenrouter: {e['upstream_message']}" if e.get("upstream_message") else ""
-    print(f"error: HTTP {code} {e.get('code')}: {e.get('message')}{extra}{allowed}{said}", file=sys.stderr)
+    detail = f" ({e['detail']})" if e.get("detail") else ""
+    print(f"error: HTTP {code} {e.get('code')}: {e.get('message')}{detail}{extra}{allowed}", file=sys.stderr)
     sys.exit(1)
 
-for img in j.get("images", []):
+EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
+saved = 0
+for idx, img in enumerate(j.get("images", []), 1):
     url, name = img.get("url"), img.get("file")
+    if not url and img.get("base64"):
+        # The relay could not store the file and sent it inline instead (no relay file name, so no --ref later).
+        import base64, binascii
+        try:
+            data = base64.b64decode(img["base64"], validate=True)
+        except (binascii.Error, ValueError):
+            print(f"error: image {idx} came back inline but its data is invalid", file=sys.stderr)
+            continue
+        dest = os.path.join(out, f"{j.get('job_id') or int(time.time())}-{idx}.{EXT.get(img.get('mime_type'), 'png')}")
+        with open(dest, "wb") as f:
+            f.write(data)
+        saved += 1
+        print(f"saved: {os.path.abspath(dest)}  ({len(data)} bytes, relay file: - (returned inline))")
+        continue
     if not url:
+        print(f"warning: image {idx} has neither a URL nor inline data; skipped", file=sys.stderr)
         continue
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"} if name else {})
     for attempt in range(6):
@@ -100,7 +116,11 @@ for img in j.get("images", []):
     dest = os.path.join(out, name or os.path.basename(url.split("?")[0]) or "image.png")
     with open(dest, "wb") as f:
         f.write(data)
+    saved += 1
     print(f"saved: {os.path.abspath(dest)}  ({len(data)} bytes, relay file: {name or '-'})")
+if not saved:
+    print("error: the relay reported success but no image could be saved", file=sys.stderr)
+    sys.exit(1)
 print(f"model: {j.get('model')}")
 if j.get("text"):
     print(f"model text: {j['text']}")

@@ -4,6 +4,7 @@
 # Runtime data
 /storage/*
 !/storage/.gitkeep
+!/storage/.htaccess
 *.log
 # Editor / tooling
 /.claude/

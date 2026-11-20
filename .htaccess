@@ -1,11 +1,15 @@
+# Front controller: every request is handled by index.php and nothing is served from disk, so config.php,
+# storage/, bin/, skill/, .git/ and the test pages are never reachable as files. (Same as the nginx config.)
 RewriteEngine On
-RewriteCond %{REQUEST_FILENAME} !-f
-RewriteRule ^ index.php [L]
 
 # Pass the Authorization header through to PHP (CGI/FastCGI)
 RewriteCond %{HTTP:Authorization} .
 RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
 
-<FilesMatch "^(config\.php|moderation\.php|relay\.log)$">
+RewriteRule ^index\.php$ - [L]
+RewriteRule ^ index.php [L]
+
+# Second line of defence (e.g. if mod_rewrite is ever switched off): refuse every file except index.php.
+<FilesMatch "^(?!index\.php$)">
     Require all denied
 </FilesMatch>

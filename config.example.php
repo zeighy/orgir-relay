@@ -46,12 +46,15 @@ return [
     // ---- Local image generation (mlx-serve, OpenAI-compatible) --------------
     // When the requested "model" is listed under one of the endpoints, /generate is served by
     // POST {base_url}/images/generations on that endpoint instead of OpenRouter, so several servers (or ports)
-    // can each host different models. Local models are allowed automatically (still subject to per-token
-    // allowed_models) and appear in GET /models. Reference images are rejected for a local model unless its endpoint sets 'input_images' => true.
+    // can each host different models. Local models appear in GET /models, but like any other model they must be listed
+    // in images.allowed_models (unless that list is empty, or 'auto_allow' below is true); per-token allowed_models
+    // still apply. Reference images are rejected for a local model unless its endpoint sets 'input_images' => true.
     // Everything except 'enabled' and 'endpoints' is a shared default that an endpoint may override (timeout, retries,
     // check_back_seconds, busy_wait_seconds, max_images_per_request, sizes, quality, input_images, omit_size_with_refs, verify_ssl).
     'local_images' => [
-        'enabled' => true,
+        'enabled' => false,   // set to true once the endpoints below actually exist
+        // true = every local model is added to images.allowed_models automatically. false = list them there yourself.
+        'auto_allow' => false,
         'endpoints' => [
             [
                 'name' => 'mlx-1',
@@ -144,8 +147,8 @@ return [
         'default_mode' => 'url',
         // Delete saved images older than this many hours (0 = never).
         'retention_hours' => 24,
-        // Public base URL of this app, used to build download links.
-        // Leave empty to auto-detect from the request.
+        // Public base URL of this app, used to build download links, e.g. 'https://relay.example.com'.
+        // Set it in production. Empty = built from the request's Host header (only if it looks like a host name).
         'public_base_url' => '',
     ],
 
@@ -161,7 +164,10 @@ return [
          *   rate_limit     int    requests per minute (overrides default)
          *   allowed_models array  restrict this token to specific models
          *   expires        string any strtotime()-parsable date
-         *   moderation     bool   false = skip the prompt content filter for this token
+         *   moderation     bool   false = skip the prompt checks (keywords + second opinion) for this token
+         *   image_check    bool   false = skip the reference-image check for this token
+         *   max_concurrent int    requests this token may have running at once (overrides default_max_concurrent)
+         *   daily_budget   float  USD per UTC day (overrides default_daily_budget; 0 = unlimited)
          */
         'tokens' => [
             // 'claude-skill' => [
@@ -176,10 +182,26 @@ return [
         'viewer_tokens' => [],
         'default_rate_limit' => 30,           // requests / minute / token
         'rate_limit_dir' => __DIR__ . '/storage/ratelimit',
-        // Optional IP allowlist (exact IPs). Empty = any IP.
+        // Optional IP allowlist for the API: exact IPs or CIDR ranges ('100.64.0.0/10'). Empty = any IP.
         'ip_allowlist' => [],
-        // Require HTTPS (honours X-Forwarded-Proto). Disable for local dev.
+        // Reverse proxies (IPs or CIDR ranges) whose X-Forwarded-For / X-Forwarded-Proto headers are believed. Requests
+        // from anywhere else are judged by their own connection, so those headers can't be forged. Add your proxy or
+        // load balancer here if it is not on the same machine.
+        'trusted_proxies' => ['127.0.0.1', '::1'],
+        // Require HTTPS (directly, or X-Forwarded-Proto from a trusted proxy). Disable for local dev.
         'require_https' => false,
+        // Generation/speech requests running at once. Each one keeps a PHP worker busy (async jobs too, after their
+        // 202), so keep max_concurrent_jobs below PHP-FPM's pm.max_children or the API stops answering polls.
+        // Over the limit = 429 too_many_jobs. 0 = no limit.
+        'max_concurrent_jobs' => 3,           // all tokens together
+        'default_max_concurrent' => 2,        // per token
+        // Daily spending cap per token in USD, from what OpenRouter reports (images and screening; speech reports no
+        // cost and is not counted, but is refused once the cap is hit). Over it = 429 budget_exceeded until 00:00 UTC.
+        // Requests already running still finish, so it can overshoot slightly. 0 = no cap.
+        'default_daily_budget' => 0,
+        // /history sign-in: failed attempts per IP allowed within the window (seconds) before it answers 429.
+        'viewer_login_attempts' => 10,
+        'viewer_login_window' => 900,
         // Delay (ms) added after a failed auth attempt to slow brute forcing.
         'failed_auth_delay_ms' => 300,
     ],
